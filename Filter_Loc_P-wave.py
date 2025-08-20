@@ -1,161 +1,166 @@
 import os
 import numpy as np
 import wfdb
-import pywt
 import matplotlib.pyplot as plt
-from scipy.signal import butter, filtfilt, find_peaks
-DATA_DIR = r"C:\Users\Omar\Downloads\brno-university-of-technology-ecg-signal-database-with-annotations-of-p-wave-but-pdb-1.0.0"
-NUM_RECORDS = 50
-TOL_MS = 50  # tolerance ms
+from scipy.signal import butter, filtfilt, medfilt
 
-def bandpass(sig, fs, low=0.5, high=40.0):
-    from scipy.signal import butter, filtfilt
+# --- Configuration ---
+# ***** UPDATE THIS PATH *****
+DATA_DIR = r"C:\Users\merna\OneDrive\Documents\Biomed\brno-university-of-technology-ecg-signal-database-with-annotations-of-p-wave-but-pdb-1.0.0\brno-university-of-technology-ecg-signal-database-with-annotations-of-p-wave-but-pdb-1.0.0"
+NUM_RECORDS = 50
+TOL_MS = 50  # Tolerance for accuracy calculation in milliseconds
+
+# --- Preprocessing Functions ---
+
+def bandpass(sig, fs, low=0.5, high=35.0):
+    """Applies a 4th-order Butterworth bandpass filter. High-end is lowered to reduce noise."""
     b, a = butter(4, [low, high], btype="band", fs=fs)
     return filtfilt(b, a, sig)
 
-def enhance_pwave(sig, fs):
-    """Wavelet-based P-wave enhancement."""
-    coeffs = pywt.wavedec(sig, 'db4', level=5)
-    coeffs_keep = [None] * len(coeffs)
+def remove_baseline_wander(sig, fs):
+    """Removes baseline wander using dual median filtering."""
+    win_1 = int(0.2 * fs) | 1
+    baseline_1 = medfilt(sig, kernel_size=win_1)
+    win_2 = int(0.6 * fs) | 1
+    baseline_2 = medfilt(baseline_1, kernel_size=win_2)
+    return sig - baseline_2
 
-    # keep mid-level details (avoid lowest & highest freq noise)
-    for i in range(1, len(coeffs)-1):
-        coeffs_keep[i] = coeffs[i]
+# --- P-Wave Detection ---
 
-    enhanced = pywt.waverec(coeffs_keep, 'db4')
-
-    # fix mismatch length
-    if len(enhanced) > len(sig):
-        enhanced = enhanced[:len(sig)]
-    elif len(enhanced) < len(sig):
-        enhanced = np.pad(enhanced, (0, len(sig)-len(enhanced)), mode="edge")
-
-    return enhanced
-
-def detect_p(sig, fs, qrs, enhance_func):
-    #Detect P-wave locations using adaptive PR window + wavelet-enhanced signal.
-    enhanced = enhance_func(sig, fs)
+def detect_p_robust(sig, fs, qrs):
+    """
+    P-wave detection using a direct search in a defined window.
+    This function operates on a pre-filtered signal.
+    """
     p_locs = []
+    
+    for r_peak in qrs:
+        # Define a wider, more reliable search window based on physiological PR interval.
+        # Window: from 240ms to 80ms before the R-peak.
+        search_win_start = max(0, r_peak - int(0.24 * fs))
+        search_win_end = max(0, r_peak - int(0.08 * fs))
 
-    for i, r in enumerate(qrs):
-        # Estimate RR interval
-        if i > 0:
-            rr = (r - qrs[i - 1]) / fs  # seconds
-        else:
-            rr = np.median(np.diff(qrs) / fs)  # fallback median RR
-
-        # Adaptive PR interval window
-        if rr < 0.7:      # fast HR
-            pr_min, pr_max = 0.08, 0.15
-        elif rr > 1.2:    # slow HR
-            pr_min, pr_max = 0.12, 0.20
-        else:             # normal HR
-            pr_min, pr_max = 0.10, 0.18
-
-        start = max(0, int(r - pr_max * fs))
-        end   = max(0, int(r - pr_min * fs))
-
-        if end > start:
-            seg = enhanced[start:end]
-            if len(seg) > 0:
-                # Peak detection with prominence
-                peaks, props = find_peaks(
-                    seg,
-                    distance=int(0.04*fs),           # min 40 ms apart
-                    prominence=np.std(seg)*0.3       # avoid tiny blips
-                )
-
-                if len(peaks) > 0:
-                    # choose closest to ~160ms before QRS
-                    target = r - int(0.16*fs)
-                    best_peak = min(peaks, key=lambda p: abs((start+p) - target))
-                    p_locs.append(start + best_peak)
-                else:
-                    # fallback: fixed offset
-                    p_locs.append(r - int(0.16*fs))
-            else:
-                p_locs.append(None)
-        else:
+        if search_win_end <= search_win_start:
             p_locs.append(None)
+            continue
+        
+        # Extract the segment of the signal where the P-wave is expected
+        search_segment = sig[search_win_start:search_win_end]
+        
+        if search_segment.size == 0:
+            p_locs.append(None)
+            continue
 
+        # Find the index of the absolute maximum value in the segment.
+        # This works for both positive and inverted P-waves.
+        # We use np.argmax on the absolute value to find the peak's location,
+        # whether it's upright or inverted.
+        p_peak_relative_loc = np.argmax(np.abs(search_segment))
+        
+        # Convert the relative location back to the signal's absolute index
+        p_locs.append(search_win_start + p_peak_relative_loc)
+        
     return p_locs
 
+# --- Accuracy Calculation ---
+
 def compute_accuracy(detected, true, fs, tol_ms=TOL_MS):
+    """Computes detection accuracy (Sensitivity or TP / (TP + FN))."""
     tol_samples = int(tol_ms * fs / 1000)
     detected = sorted([d for d in detected if d is not None])
     true = sorted(true)
 
-    matched = 0
-    used = set()
+    if not true:
+        return 1.0 if not detected else 0.0
 
-    for d in detected:
-        for i, t in enumerate(true):
-            if i in used:
-                continue
-            if abs(d - t) <= tol_samples:
-                matched += 1
-                used.add(i)
-                break
+    tp = 0  # True Positives
+    used_true_indices = set()
 
-    accuracy = matched / len(true) if len(true) > 0 else 0
-    return accuracy
+    # Match each detected peak to the closest true peak within the tolerance
+    for d_peak in detected:
+        best_match_idx = -1
+        min_dist = float('inf')
+        
+        for i, t_peak in enumerate(true):
+            dist = abs(d_peak - t_peak)
+            if dist <= tol_samples and dist < min_dist:
+                min_dist = dist
+                best_match_idx = i
+        
+        if best_match_idx != -1 and best_match_idx not in used_true_indices:
+            tp += 1
+            used_true_indices.add(best_match_idx)
+    
+    fn = len(true) - tp # False Negatives are true peaks that were not detected
+    
+    sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    return sensitivity
+
+# --- Main Execution Loop ---
 
 accuracies = []
-
-for rec_id in [f"{i:02d}" for i in range(1, NUM_RECORDS+1)]:
+print("--- Starting P-Wave Detection Analysis (Robust Version) ---")
+for rec_id in [f"{i:02d}" for i in range(1, NUM_RECORDS + 1)]:
     try:
         rec_path = os.path.join(DATA_DIR, rec_id)
         rec = wfdb.rdrecord(rec_path)
-        sig = rec.p_signal[:, 0]   # lead 0 only
+        sig_original = rec.p_signal[:, 0]
         fs = rec.fs
         qrs = wfdb.rdann(rec_path, "qrs").sample
 
-        # Detect P-waves
-        p_locs = detect_p(sig, fs, qrs, enhance_pwave)
+        # --- Signal Processing Pipeline ---
+        sig_filtered = bandpass(sig_original, fs)
+        sig_clean = remove_baseline_wander(sig_filtered, fs)
+        
+        # Use the new, robust detection function
+        p_locs = detect_p_robust(sig_clean, fs, qrs)
 
-        # Save detections to text
-        out_path = os.path.join(DATA_DIR, f"{rec_id}_p_detect_wavelet.txt")
-        with open(out_path, "w") as f:
-            for r, p in zip(qrs, p_locs):
-                f.write(f"QRS={r}, P={p}\n")
-
-        # Load ground-truth annotations
+        # --- Evaluation ---
         pwave_file = os.path.join(DATA_DIR, f"{rec_id}.pwave")
         if os.path.exists(pwave_file):
             p_true = wfdb.rdann(pwave_file[:-6], "pwave").sample
-            acc = compute_accuracy(p_locs, p_true, fs)
+            acc = compute_accuracy(p_locs, p_true, fs, tol_ms=TOL_MS)
             accuracies.append(acc)
-            print(f"{rec_id}: Accuracy={acc:.2f}")
+            print(f"Record {rec_id}: Accuracy = {acc:.3f}")
         else:
-            print(f"{rec_id}: No P-wave annotation found!")
+            print(f"Record {rec_id}: No ground-truth P-wave annotation found.")
 
     except Exception as e:
-        print(f"{rec_id}: error {e}")
+        print(f"Record {rec_id}: Error processing file - {e}")
 
 if accuracies:
     overall_acc = np.mean(accuracies)
-    print(f"\nOverall P-wave detection accuracy: {overall_acc:.2f}")
+    print("\n-------------------------------------------------")
+    print(f"✅ Overall P-Wave Detection Accuracy: {overall_acc:.3f}")
+    print("-------------------------------------------------")
 else:
-    print("No records with P-wave annotations found.")
-#####debg
+    print("\nNo records with P-wave annotations were processed successfully.")
+
+# --- Visualization for Debugging ---
+print("\nGenerating visualization for Record '01'...")
 rec_id = "01"
-rec = wfdb.rdrecord(os.path.join(DATA_DIR, rec_id))
+rec_path = os.path.join(DATA_DIR, rec_id)
+rec = wfdb.rdrecord(rec_path)
 sig = rec.p_signal[:, 0]
 fs = rec.fs
-qrs = wfdb.rdann(os.path.join(DATA_DIR, rec_id), "qrs").sample
-p_locs = detect_p(sig, fs, qrs, enhance_pwave)
+qrs = wfdb.rdann(rec_path, "qrs").sample
+
+# Rerun the processing pipeline for the plot
+sig_filtered = bandpass(sig, fs)
+sig_clean = remove_baseline_wander(sig_filtered, fs)
+p_locs_debug = detect_p_robust(sig_clean, fs, qrs)
+
 t = np.arange(len(sig)) / fs
-enhanced = enhance_pwave(sig, fs)
 
-plt.figure(figsize=(12, 5))
-plt.plot(t, sig, label="Original", alpha=0.5)
-plt.plot(t, enhanced, label="Wavelet-enhanced", alpha=0.8)
-for r in qrs:
-    plt.axvline(r/fs, color="r", alpha=0.2)
-for p in p_locs:
-    if p is not None:
-        plt.plot(p/fs, enhanced[p], "go")
+# Plotting
+plt.figure(figsize=(18, 6))
+plt.plot(t, sig_clean, label="Cleaned ECG Signal", color='blue', alpha=0.8)
+plt.plot(t[p_locs_debug], sig_clean[p_locs_debug], 'ro', markersize=8, label="Detected P-Peaks")
+plt.plot(t[qrs], sig_clean[qrs], 'x', color='purple', markersize=10, label="QRS Peaks")
+plt.title("P-Wave Detection on Cleaned Signal (Record 01)", fontsize=14)
+plt.xlabel("Time (s)", fontsize=12)
+plt.ylabel("Amplitude (mV)", fontsize=12)
 plt.legend()
-plt.title("Record 01 P-wave detection (wavelet)")
+plt.grid(linestyle='--', alpha=0.6)
+plt.xlim(10, 15) # Zoom into a 5-second window for clarity
 plt.show()
-
