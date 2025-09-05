@@ -102,6 +102,26 @@ def compute_accuracy(detected, true, fs, tol_ms=TOL_MS):
 
 accuracies = []
 
+def amplify_pwave(sig, fs, gain=2.0):
+    coeffs = pywt.wavedec(sig, 'db4', level=5)
+    coeffs_keep = [None] * len(coeffs)
+
+    # keep mid-level details (avoid lowest & highest freq noise)
+    for i in range(1, len(coeffs)-1):
+        coeffs_keep[i] = coeffs[i]
+
+    enhanced = pywt.waverec(coeffs_keep, 'db4')
+
+    # fix mismatch length
+    if len(enhanced) > len(sig):
+        enhanced = enhanced[:len(sig)]
+    elif len(enhanced) < len(sig):
+        enhanced = np.pad(enhanced, (0, len(sig)-len(enhanced)), mode="edge")
+
+    # amplify
+    return enhanced * gain
+
+
 for rec_id in [f"{i:02d}" for i in range(1, NUM_RECORDS+1)]:
     try:
         rec_path = os.path.join(DATA_DIR, rec_id)
@@ -143,9 +163,10 @@ rec = wfdb.rdrecord(os.path.join(DATA_DIR, rec_id))
 sig = rec.p_signal[:, 0]
 fs = rec.fs
 qrs = wfdb.rdann(os.path.join(DATA_DIR, rec_id), "qrs").sample
-p_locs = detect_p(sig, fs, qrs, enhance_pwave)
+p_locs = detect_p(sig, fs, qrs, lambda s, f: amplify_pwave(s, f, gain=3.0))
 t = np.arange(len(sig)) / fs
-enhanced = enhance_pwave(sig, fs)
+enhanced = amplify_pwave(sig, fs, gain=3.0)
+
 
 plt.figure(figsize=(12, 5))
 plt.plot(t, sig, label="Original", alpha=0.5)
@@ -158,4 +179,6 @@ for p in p_locs:
 plt.legend()
 plt.title("Record 01 P-wave detection (wavelet)")
 plt.show()
+
+
 
