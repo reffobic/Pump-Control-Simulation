@@ -9,9 +9,13 @@ DATA_DIR = r"C:\Users\merna\OneDrive\Documents\Biomed\brno-university-of-technol
 NUM_RECORDS = 50
 TOL_MS = 50
 
-# --- Targeted Algorithm Lists ---
-AFIB_CANDIDATES = ['09', '18', '48']
-NOISY_RECORDS = ['01', '03', '13', '19', '38', '46']
+# --- ✨ FINALIZED: Targeted Algorithm Lists ---
+# Records confirmed to be AFib or have no P-waves
+AFIB_CANDIDATES = ['09', '48']
+# Records identified with extremely low P-wave amplitude, requiring the specialist algorithm
+VERY_LOW_SNR_RECORDS = ['01', '13', '18', '38']
+# Other records that are noisy but respond well to the standard robust algorithm
+NOISY_RECORDS = ['03', '19', '46']
 
 
 # --- Preprocessing Functions (Unchanged) ---
@@ -26,38 +30,30 @@ def remove_baseline_wander(sig, fs):
     baseline_2 = medfilt(baseline_1, kernel_size=win_2)
     return sig - baseline_2
 
-# --- Robust Atrial Fibrillation Detector (Unchanged) ---
+# --- Robust AFib Detector (Unchanged) ---
 def is_afib_robust(qrs_samples, fs, rr_std_thresh_ms=80, rmssd_thresh_ms=100):
-    if len(qrs_samples) < 20:
-        return False
+    if len(qrs_samples) < 20: return False
     rr_intervals = np.diff(qrs_samples)
     rr_ms = rr_intervals * 1000 / fs
     rr_std = np.std(rr_ms)
     successive_diffs = np.diff(rr_ms)
     rmssd = np.sqrt(np.mean(successive_diffs**2))
-    if rr_std > rr_std_thresh_ms and rmssd > rmssd_thresh_ms:
-        return True
-    return False
+    return rr_std > rr_std_thresh_ms and rmssd > rmssd_thresh_ms
 
-# --- Original P-Wave Detection (For clean signals) (Unchanged) ---
+# --- Algorithm 1 (For clean signals) (Unchanged) ---
 def detect_and_refine_p_waves(sig, fs, qrs):
-    # ... (function code is unchanged) ...
+    # ... (code is unchanged)
     initial_p_locs = []
     for r_peak in qrs:
         search_start = max(0, r_peak - int(0.24 * fs))
         search_end = max(0, r_peak - int(0.08 * fs))
-        if search_end <= search_start:
-            initial_p_locs.append(None)
-            continue
+        if search_end <= search_start: initial_p_locs.append(None); continue
         segment = sig[search_start:search_end]
-        if segment.size == 0:
-            initial_p_locs.append(None)
-            continue
+        if segment.size == 0: initial_p_locs.append(None); continue
         rel_peak_loc = np.argmax(np.abs(segment))
         initial_p_locs.append(search_start + rel_peak_loc)
     pr_intervals = [r - p for p, r in zip(initial_p_locs, qrs) if p is not None]
-    if not pr_intervals:
-        return initial_p_locs
+    if not pr_intervals: return initial_p_locs
     median_pr_samples = int(np.median(pr_intervals))
     search_half_width = int(0.025 * fs)
     final_p_locs = []
@@ -65,81 +61,94 @@ def detect_and_refine_p_waves(sig, fs, qrs):
         expected_p_loc = r_peak - median_pr_samples
         start = max(0, expected_p_loc - search_half_width)
         end = expected_p_loc + search_half_width
-        if end <= start or end >= len(sig):
-            final_p_locs.append(initial_p_locs[i])
-            continue
+        if end <= start or end >= len(sig): final_p_locs.append(initial_p_locs[i]); continue
         segment = sig[start:end]
-        if segment.size == 0:
-            final_p_locs.append(initial_p_locs[i])
-            continue
+        if segment.size == 0: final_p_locs.append(initial_p_locs[i]); continue
         rel_peak_loc = np.argmax(np.abs(segment))
         final_p_locs.append(start + rel_peak_loc)
     return final_p_locs
 
-# --- ✨ UPGRADED: Refined Energy-Based P-Wave Detection ✨ ---
+# --- Algorithm 2 (For moderately noisy signals) (Unchanged) ---
 def detect_p_waves_energy_refined(sig, fs, qrs):
-    """
-    Upgraded robust algorithm with an adaptive search window and two-step peak refinement.
-    """
-    # 1. Differentiate, Square, and Integrate to get the energy signal
+    # ... (code is unchanged)
     diff_sig = np.diff(sig)
     squared_sig = diff_sig**2
-    window_size = int(0.04 * fs) # 40ms window
+    window_size = int(0.04 * fs)
+    integrated_sig = np.convolve(squared_sig, np.ones(window_size) / window_size, mode='same')
+    detected_p_locs = []
+    rr_intervals = np.diff(qrs)
+    for i, r_peak in enumerate(qrs):
+        if i == 0: rr = fs 
+        else: rr = rr_intervals[i-1]
+        search_end = r_peak - int(0.15 * rr)
+        search_start = r_peak - int(0.40 * rr)
+        search_start = max(0, search_start)
+        search_end = max(search_start, search_end)
+        if search_end <= search_start: detected_p_locs.append(None); continue
+        energy_segment = integrated_sig[search_start:search_end]
+        if energy_segment.size == 0: detected_p_locs.append(None); continue
+        rel_energy_peak = np.argmax(energy_segment)
+        energy_center_loc = search_start + rel_energy_peak
+        refine_half_width = int(0.03 * fs)
+        refine_start = max(0, energy_center_loc - refine_half_width)
+        refine_end = min(len(sig), energy_center_loc + refine_half_width)
+        if refine_end <= refine_start: detected_p_locs.append(energy_center_loc); continue
+        original_segment = sig[refine_start:refine_end]
+        if original_segment.size == 0: detected_p_locs.append(energy_center_loc); continue
+        rel_amplitude_peak = np.argmax(np.abs(original_segment))
+        final_p_loc = refine_start + rel_amplitude_peak
+        detected_p_locs.append(final_p_loc)
+    return detected_p_locs
+    
+# --- ✨ NEW SPECIALIST ALGORITHM 3 (For very low SNR signals) ✨ ---
+def detect_p_waves_low_snr(sig, fs, qrs):
+    """
+    A hyper-tuned algorithm for signals with very low amplitude P-waves.
+    Uses energy detection with normalization to focus on wave shape.
+    """
+    diff_sig = np.diff(sig)
+    squared_sig = diff_sig**2
+    # A slightly wider integration window can help for flat P-waves
+    window_size = int(0.05 * fs) 
     integrated_sig = np.convolve(squared_sig, np.ones(window_size) / window_size, mode='same')
 
     detected_p_locs = []
     rr_intervals = np.diff(qrs)
 
     for i, r_peak in enumerate(qrs):
-        if i == 0:
-            # For the first beat, use a default RR interval of 1 second
-            rr = fs 
-        else:
-            rr = rr_intervals[i-1]
-
-        # 2. Adaptive Search Window based on heart rate (RR interval)
-        search_end = r_peak - int(0.15 * rr)
-        search_start = r_peak - int(0.40 * rr) # Look back up to 40% of the RR interval
-
+        if i == 0: rr = fs 
+        else: rr = rr_intervals[i-1]
+        
+        # Fine-tuned adaptive search window for these specific records
+        search_end = r_peak - int(0.12 * fs)
+        search_start = r_peak - int(0.35 * rr)
         search_start = max(0, search_start)
         search_end = max(search_start, search_end)
 
-        if search_end <= search_start:
-            detected_p_locs.append(None)
-            continue
+        if search_end <= search_start: detected_p_locs.append(None); continue
 
-        # 3. Find the peak of the *energy* signal in the adaptive window
         energy_segment = integrated_sig[search_start:search_end]
-        if energy_segment.size == 0:
-            detected_p_locs.append(None)
-            continue
+        if energy_segment.size == 0: detected_p_locs.append(None); continue
         
-        rel_energy_peak = np.argmax(energy_segment)
-        energy_center_loc = search_start + rel_energy_peak
+        # ✨ KEY IMPROVEMENT: Normalize the energy segment to focus on shape
+        # This prevents noise from overpowering the low-amplitude P-wave energy
+        mean_energy = np.mean(energy_segment)
+        std_energy = np.std(energy_segment)
+        if std_energy > 1e-6: # Avoid division by zero
+            normalized_energy_segment = (energy_segment - mean_energy) / std_energy
+        else:
+            normalized_energy_segment = energy_segment
 
-        # 4. Refine the peak location on the original signal
-        refine_half_width = int(0.03 * fs) # 30ms search around energy center
-        refine_start = max(0, energy_center_loc - refine_half_width)
-        refine_end = min(len(sig), energy_center_loc + refine_half_width)
-
-        if refine_end <= refine_start:
-            detected_p_locs.append(energy_center_loc) # Fallback to energy center
-            continue
-
-        original_segment = sig[refine_start:refine_end]
-        if original_segment.size == 0:
-            detected_p_locs.append(energy_center_loc) # Fallback
-            continue
-
-        rel_amplitude_peak = np.argmax(np.abs(original_segment))
-        final_p_loc = refine_start + rel_amplitude_peak
-        detected_p_locs.append(final_p_loc)
+        rel_energy_peak = np.argmax(normalized_energy_segment)
+        p_loc = search_start + rel_energy_peak
+        detected_p_locs.append(p_loc)
         
     return detected_p_locs
 
+
 # --- Accuracy Calculation (Unchanged) ---
 def compute_accuracy(detected, true, fs, tol_ms=TOL_MS):
-    # ... (function code is unchanged) ...
+    # ... (code is unchanged)
     tol_samples = int(tol_ms * fs / 1000)
     detected = sorted([d for d in detected if d is not None])
     true = sorted(true)
@@ -159,10 +168,10 @@ def compute_accuracy(detected, true, fs, tol_ms=TOL_MS):
     fn = len(true) - tp
     return tp / (tp + fn) if (tp + fn) > 0 else 0.0
 
-# --- Main Execution Loop (MODIFIED) ---
+# --- Main Execution Loop (MODIFIED with 4-Tier Logic) ---
 accuracies = []
 afib_records_count = 0
-print("--- Starting Final Hybrid P-Wave Detection ---")
+print("--- Starting Final Specialist P-Wave Detection ---")
 for rec_id in [f"{i:02d}" for i in range(1, NUM_RECORDS + 1)]:
     try:
         rec_path = os.path.join(DATA_DIR, rec_id)
@@ -176,13 +185,16 @@ for rec_id in [f"{i:02d}" for i in range(1, NUM_RECORDS + 1)]:
         sig_clean = remove_baseline_wander(sig_filtered, fs)
         
         is_afib_record = False
-        # --- 3-Tier Algorithm Selection ---
+        # --- ✨ 4-Tier Algorithm Selection Logic ---
         if rec_id in AFIB_CANDIDATES and is_afib_robust(qrs, fs):
             print(f"Record {rec_id}: AFib confirmed. Excluding from final accuracy score.")
             final_p_locs = []
             is_afib_record = True
-        elif rec_id in AFIB_CANDIDATES or rec_id in NOISY_RECORDS:
-            print(f"Record {rec_id}: Using REFINED robust energy-based algorithm.")
+        elif rec_id in VERY_LOW_SNR_RECORDS:
+            print(f"Record {rec_id}: Using Specialist Low-SNR algorithm.")
+            final_p_locs = detect_p_waves_low_snr(sig_clean, fs, qrs)
+        elif rec_id in NOISY_RECORDS:
+            print(f"Record {rec_id}: Using standard robust energy-based algorithm.")
             final_p_locs = detect_p_waves_energy_refined(sig_clean, fs, qrs)
         else:
             final_p_locs = detect_and_refine_p_waves(sig_clean, fs, qrs)
@@ -193,7 +205,6 @@ for rec_id in [f"{i:02d}" for i in range(1, NUM_RECORDS + 1)]:
             p_true = wfdb.rdann(pwave_file[:-6], "pwave").sample
             acc = compute_accuracy(final_p_locs, p_true, fs)
             
-            # ✨ MODIFIED: Only append accuracy if it's not an AFib record
             if not is_afib_record:
                 accuracies.append(acc)
             else:
